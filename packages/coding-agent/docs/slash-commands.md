@@ -28,6 +28,7 @@ Extensions, prompt templates, and skills can add commands. The command menu in P
 | `/fork` | Create a new session from an earlier user message |
 | `/clone` | Duplicate the current session at its current position |
 | `/compact [instructions]` | Compact the current context, optionally with custom instructions |
+| `/elision` | Permanently replace active tool results with generated summaries |
 | `/import <path>` | Import and resume a JSONL session |
 
 ## Export and share

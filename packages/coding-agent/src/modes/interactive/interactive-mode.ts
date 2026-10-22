@@ -3314,6 +3314,11 @@ export class InteractiveMode {
 				await this.handleCompactCommand(customInstructions);
 				return;
 			}
+			if (text === "/elision") {
+				this.editor.setText("");
+				await this.handleElisionCommand();
+				return;
+			}
 			if (text === "/reload") {
 				this.editor.setText("");
 				await this.handleReloadCommand();
@@ -7093,6 +7098,37 @@ export class InteractiveMode {
 
 		this.bashComponent = undefined;
 		this.ui.requestRender();
+	}
+
+	private async handleElisionCommand(): Promise<void> {
+		if (!this.session.isIdle) {
+			this.showError("Wait for the current operation to finish before eliding tool results");
+			return;
+		}
+		const session = this.session;
+		const originalOnEscape = this.defaultEditor.onEscape;
+		this.defaultEditor.onEscape = () => session.abortCompaction();
+		this.showStatusIndicator(new WorkingStatusIndicator(this.ui, "Eliding tool results"));
+		this.ui.requestRender();
+		try {
+			const result = await session.elide((completed, total) => {
+				if (this.activeStatusIndicator?.kind === "working") {
+					this.activeStatusIndicator.setMessage(`Eliding tool results: ${completed}/${total}`);
+				}
+				this.ui.requestRender();
+			});
+			if (this.session !== session) return;
+			if (result.count > 0) this.rebuildChatFromMessages();
+			this.footer.invalidate();
+			this.showStatus(result.count > 0 ? `Elided ${result.count} tool results` : "No tool results to elide");
+		} catch (error) {
+			if (this.session === session) this.showError(error instanceof Error ? error.message : String(error));
+		} finally {
+			this.defaultEditor.onEscape = originalOnEscape;
+			this.clearStatusIndicator("working");
+			if (this.session === session) void this.flushCompactionQueue({ willRetry: false });
+			this.ui.requestRender();
+		}
 	}
 
 	private async handleCompactCommand(customInstructions?: string): Promise<void> {

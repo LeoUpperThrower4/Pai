@@ -21,6 +21,8 @@ import {
 	openSync,
 	readdirSync,
 	readSync,
+	renameSync,
+	rmSync,
 	type Stats,
 	statSync,
 	writeFileSync,
@@ -64,6 +66,8 @@ export interface SessionEntryBase {
 export interface SessionMessageEntry extends SessionEntryBase {
 	type: "message";
 	message: AgentMessage;
+	/** The tool response was permanently replaced by a generated description. */
+	elided?: boolean;
 }
 
 export interface ThinkingLevelChangeEntry extends SessionEntryBase {
@@ -1397,6 +1401,87 @@ export class SessionManager {
 		return entry.id;
 	}
 
+	/**
+	 * Permanently replace active tool results, including copies in earlier context edits.
+	 * Shared ancestor entries change for every branch in this file. No originals are archived.
+	 */
+	elideToolResults(summaries: ReadonlyMap<string, string>): void {
+		if (summaries.size === 0) return;
+		const activeIds = new Set(
+			this.buildSessionProjection().entries.flatMap(({ sourceEntry, messages }) =>
+				messages.some((message) => message.role === "toolResult") ? [sourceEntry.id] : [],
+			),
+		);
+		for (const [id, text] of summaries) {
+			const entry = this.byId.get(id);
+			if (!activeIds.has(id) || entry?.type !== "message" || entry.message.role !== "toolResult") {
+				throw new Error(`Entry ${id} is not an active tool result`);
+			}
+			if (!text.trim()) throw new Error(`Elision summary for ${id} is empty`);
+		}
+		const entries = this.fileEntries.map((entry): FileEntry => {
+			const text = entry.type === "session" ? undefined : summaries.get(entry.id);
+			if (text !== undefined && entry.type === "message" && entry.message.role === "toolResult") {
+				const message = entry.message;
+				return {
+					...entry,
+					elided: true,
+					message: {
+						role: "toolResult",
+						toolCallId: message.toolCallId,
+						toolName: message.toolName,
+						content: [{ type: "text", text }],
+						isError: message.isError,
+						timestamp: message.timestamp,
+						durationMs: message.durationMs,
+						usage: message.usage,
+					},
+				};
+			}
+			if (entry.type === "context_edit" && entry.replacement !== null) {
+				const replacement = summaries.get(entry.targetId);
+				if (replacement !== undefined) {
+					return { ...entry, replacement: { content: [{ type: "text", text: replacement }] } };
+				}
+			}
+			return entry;
+		});
+		// Record the context change after the last assistant usage, invalidating its old token estimate.
+		let leafId = this.leafId;
+		const ids = new Set(this.byId.keys());
+		for (const [targetId, text] of summaries) {
+			const id = generateId(ids);
+			ids.add(id);
+			entries.push({
+				type: "context_edit",
+				id,
+				parentId: leafId,
+				timestamp: new Date().toISOString(),
+				targetId,
+				replacement: { content: [{ type: "text", text }] },
+			});
+			leafId = id;
+		}
+		// Replace the file before changing memory so a write failure leaves both representations intact.
+		if (this.persist && this.sessionFile && this.flushed) {
+			const temporaryPath = `${this.sessionFile}.${randomUUID()}.tmp`;
+			try {
+				writeFileSync(temporaryPath, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`, {
+					flag: "wx",
+					mode: 0o600,
+				});
+				renameSync(temporaryPath, this.sessionFile);
+			} finally {
+				rmSync(temporaryPath, { force: true });
+			}
+		}
+		this.fileEntries = entries;
+		for (const entry of entries) {
+			if (entry.type !== "session") this.byId.set(entry.id, entry);
+		}
+		this.leafId = leafId;
+	}
+
 	// =========================================================================
 	// Tree Traversal
 	// =========================================================================
@@ -1515,7 +1600,7 @@ export class SessionManager {
 	/**
 	 * Get all session entries (excludes header). Returns a shallow copy.
 	 * The session is append-only: use appendXXX() to add entries, branch() to
-	 * change the leaf pointer. Entries cannot be modified or deleted.
+	 * change the leaf pointer. Only elideToolResults() destructively replaces tool responses.
 	 */
 	getEntries(): SessionEntry[] {
 		return this.fileEntries.filter((e): e is SessionEntry => e.type !== "session");

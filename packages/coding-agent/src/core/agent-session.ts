@@ -78,6 +78,7 @@ import {
 	shouldCompact,
 } from "./compaction/index.ts";
 import { DEFAULT_THINKING_LEVEL, THINKING_LEVEL_OPTIONS } from "./defaults.ts";
+import { summarizeToolResult } from "./elision.ts";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.ts";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
 import {
@@ -1835,6 +1836,9 @@ export class AgentSession {
 	 * @param onStarted Called once the run's messages are prepared, before the first request.
 	 */
 	private async _startRun(trigger: BeforeAgentStartTrigger, onStarted?: () => void): Promise<void> {
+		if (this._compactionAbortController) {
+			throw new Error("Cannot start a turn while compaction or elision is in progress");
+		}
 		this._isAgentRunActive = true;
 		this._agentRunAbortRequested = false;
 		let messages: AgentMessage[];
@@ -2744,6 +2748,61 @@ export class AgentSession {
 	// =========================================================================
 	// Compaction
 	// =========================================================================
+
+	/** Manually summarize and permanently replace every not-yet-elided active tool result. */
+	async elide(onProgress?: (completed: number, total: number) => void): Promise<{ count: number }> {
+		if (!this.isIdle) throw new Error("Wait for the current operation to finish before eliding tool results");
+		const targets = this.sessionManager.buildSessionProjection().entries.flatMap(({ sourceEntry, messages }) => {
+			if (sourceEntry.type !== "message" || sourceEntry.elided) return [];
+			return messages.flatMap((message) => (message.role === "toolResult" ? [{ id: sourceEntry.id, message }] : []));
+		});
+		if (targets.length === 0) return { count: 0 };
+		const model = this.model;
+		if (!model) throw new Error(formatNoModelSelectedMessage());
+		// Share manual compaction's busy/cancellation state so prompts queue and session switches wait.
+		const controller = new AbortController();
+		this._compactionAbortController = controller;
+		this._cacheWarmer?.cancel();
+		const sessionId = this.sessionId;
+		let leafId = this.sessionManager.getLeafId();
+		try {
+			const request = await this._getSummarizationRequestAuth(model, controller.signal);
+			const summaries = new Map<string, string>();
+			for (const target of targets) {
+				onProgress?.(summaries.size, targets.length);
+				const result = await summarizeToolResult({
+					...request,
+					message: target.message,
+					signal: controller.signal,
+					streamFn: this.agent.streamFunction,
+					retry: this.settingsManager.getRetrySettings(),
+				});
+				controller.signal.throwIfAborted();
+				if (this.sessionId !== sessionId || this.sessionManager.getLeafId() !== leafId) {
+					throw new Error("Session changed during elision; tool results were not replaced");
+				}
+				const usage = this.sessionManager.appendUsage(
+					"elision",
+					request.model.provider,
+					request.model.id,
+					result.usage,
+				);
+				leafId = usage.id;
+				this._emit({ type: "entry_appended", entry: usage });
+				summaries.set(target.id, result.text);
+			}
+			controller.signal.throwIfAborted();
+			if (this.sessionId !== sessionId || this.sessionManager.getLeafId() !== leafId) {
+				throw new Error("Session changed during elision; tool results were not replaced");
+			}
+			this.sessionManager.elideToolResults(summaries);
+			this._refreshFinalizedContext();
+			onProgress?.(targets.length, targets.length);
+			return { count: targets.length };
+		} finally {
+			this._clearManualCompactionState();
+		}
+	}
 
 	/** Generate Pi's built-in compaction summary for manual and automatic compaction. */
 	private async _runDefaultCompaction(
